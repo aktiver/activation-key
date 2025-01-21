@@ -1,83 +1,122 @@
 import base64
 import hashlib
 import hmac
-import json
 import secrets
 import time
-from typing import Dict, Any
 
 ONE_YEAR_SECONDS = 365 * 24 * 60 * 60
 
-def encode_token(payload: Dict[str, Any], server_secret: str) -> str:
-    """
-    Given a dictionary payload, produce a self-contained, HMAC-signed token (base32).
-    """
-    # Convert to JSON bytes
-    payload_json = json.dumps(payload).encode("utf-8")
+# How many bytes in each segment
+DATA_SIZE = 10   # 4 + 4 + 1 + 1
+SIG_SIZE = 10    # partial HMAC
+TOTAL_SIZE = DATA_SIZE + SIG_SIZE  # = 20
 
-    # Compute signature
-    signature = hmac.new(
-        key=server_secret.encode("utf-8"),
-        msg=payload_json,
-        digestmod=hashlib.sha256
+def _pack_data(created_at: int, expires_at: int, agent_deployed: bool) -> bytes:
+    """
+    Construct the 10-byte data block:
+      - 4 bytes: created_at (big-endian)
+      - 4 bytes: expires_at (big-endian)
+      - 1 byte: flags (lowest bit = agent_deployed, other 7 bits = random)
+      - 1 byte: random
+    """
+    # 4 bytes each for created/expires
+    created_bytes = created_at.to_bytes(4, "big", signed=False)
+    expires_bytes = expires_at.to_bytes(4, "big", signed=False)
+
+    # 1 byte: bit0 = agent_deployed, bits1-7 random
+    random_7bits = secrets.randbits(7)  # integer in [0..127]
+    agent_bit = 1 if agent_deployed else 0
+    flag_byte = (random_7bits << 1) | agent_bit  # pack agent_bit as LSB
+
+    # 1 byte: random filler
+    filler_byte = secrets.randbits(8)  # 0..255
+
+    # Combine
+    return created_bytes + expires_bytes + bytes([flag_byte, filler_byte])
+
+
+def _unpack_data(data_block: bytes):
+    """
+    Reverse of _pack_data.
+    Return (created_at, expires_at, agent_deployed).
+    """
+    if len(data_block) != 10:
+        raise ValueError("Data block must be 10 bytes")
+
+    created_at = int.from_bytes(data_block[0:4], "big", signed=False)
+    expires_at = int.from_bytes(data_block[4:8], "big", signed=False)
+
+    flag_byte = data_block[8]
+    agent_deployed = bool(flag_byte & 0x01)  # LSB is agent flag
+
+    # data_block[9] is the random filler byte (not crucial for logic)
+
+    return created_at, expires_at, agent_deployed
+
+
+def _compute_partial_signature(data_block: bytes, server_secret: str) -> bytes:
+    """
+    Compute full HMAC-SHA256 over data_block, but return only the first 10 bytes (partial).
+    """
+    full_digest = hmac.new(
+        server_secret.encode("utf-8"),
+        data_block,
+        hashlib.sha256
     ).digest()
-
-    # Combine payload and signature
-    combined = payload_json + b":::" + signature
-
-    # Return a base32-encoded string
-    return base64.b32encode(combined).decode("utf-8")
+    return full_digest[:SIG_SIZE]  # 10 bytes
 
 
-def decode_token(full_token: str, server_secret: str) -> Dict[str, Any]:
+
+def decode_novel_key(pretty_key: str, server_secret: str):
     """
-    Decode and validate a full base32 token.
-    Returns the payload dict if valid, otherwise raises ValueError.
+    Reverse of encode_novel_key.
+    1) Remove dashes => 35 chars
+    2) Discard last 3 "XXX" => 32 chars
+    3) Base32 decode => 20 raw bytes
+    4) Split => 10-byte data + 10-byte signature
+    5) Recompute partial HMAC => compare
+    6) Unpack data => (created_at, expires_at, agent_deployed)
+    Raises ValueError if signature mismatch or expired.
+    Returns dict: { "created_at", "expires_at", "agent_deployed" }
     """
-    try:
-        combined = base64.b32decode(full_token.encode("utf-8"))
-    except Exception:
-        raise ValueError("Invalid token: cannot decode base32.")
+    raw = pretty_key.replace("-", "")
+    if len(raw) != 35:
+        raise ValueError("Expected 35 characters with dashes removed")
 
-    # Split at the ':::' separator
-    if b":::" not in combined:
-        raise ValueError("Invalid token: missing separator.")
-    payload_json, signature = combined.split(b":::", 1)
+    # remove filler
+    real_b32 = raw[:-3]  # first 32
+    combined = base64.b32decode(real_b32)  # => 20 bytes
 
-    # Recompute the expected signature
-    expected_signature = hmac.new(
-        key=server_secret.encode("utf-8"),
-        msg=payload_json,
-        digestmod=hashlib.sha256
-    ).digest()
+    if len(combined) != TOTAL_SIZE:  # 20
+        raise ValueError("Decoded length mismatch")
 
-    # Compare signatures in constant time
-    if not hmac.compare_digest(signature, expected_signature):
-        raise ValueError("Invalid token: signature mismatch (tampered or wrong).")
+    data_block = combined[:DATA_SIZE]   # first 10
+    sig_block = combined[DATA_SIZE:]    # next 10
 
-    # Decode the JSON
-    payload = json.loads(payload_json)
+    # Recompute partial signature
+    expected_sig = _compute_partial_signature(data_block, server_secret)
+    if not hmac.compare_digest(sig_block, expected_sig):
+        raise ValueError("Signature mismatch (tampered or invalid)")
 
-    # Check expiration
+    # Unpack
+    created_at, expires_at, agent_deployed = _unpack_data(data_block)
     now = int(time.time())
-    expires_at = payload.get("expires_at")
-    if not expires_at or now > expires_at:
-        raise ValueError("Token has expired.")
+    if now > expires_at:
+        raise ValueError("Key has expired")
 
-    return payload
+    return {
+        "created_at": created_at,
+        "expires_at": expires_at,
+        "agent_deployed": agent_deployed
+    }
 
 
-
-def set_agent_deployed(full_token: str, server_secret: str, deployed: bool) -> str:
+def set_agent_deployed(novel_key: str, server_secret: str, deploy: bool) -> str:
     """
-    Decodes the token, sets agent_deployed to 1 or 0, then re-encodes and returns the new token.
-    If the token is invalid or expired, raises ValueError.
+    Decode the key, set agent_deployed= (1 or 0), re-encode.
     """
-    payload = decode_token(full_token, server_secret)
-    # If you want to enforce a one-time use, you could forbid switching from 1->0
-    # for demonstration, we allow toggling.
-    payload["agent_deployed"] = 1 if deployed else 0
-
-    # Re-encode with the updated payload
-    new_token = encode_token(payload, server_secret)
-    return new_token
+    info = decode_novel_key(novel_key, server_secret)
+    new_created = info["created_at"]
+    new_expires = info["expires_at"]
+    new_agent_flag = deploy
+    return encode_novel_key(new_created, new_expires, new_agent_flag, server_secret)
